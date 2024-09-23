@@ -141,3 +141,4 @@ dmypy.json
 *.dat
 *.pt
 /test*.py
+spikingjelly/docs/source/_static/tutorials/activation_based/14_classify_dvsg/T_16_b_16_c_128_Adam_lr_0.001_CosALR_64_amp_cext/dvsg_logs/events.out.tfevents.1618393625.de41f92009cf3011eb0ac59057a81652d2d0-fangw1714-0.14358.0

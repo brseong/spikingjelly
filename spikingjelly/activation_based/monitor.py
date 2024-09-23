@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from torch import nn
 from typing import Callable, Union, Optional
-from spikingjelly.activation_based import neuron
+from . import neuron
 import threading
 from torch.utils.tensorboard import SummaryWriter
 import os
