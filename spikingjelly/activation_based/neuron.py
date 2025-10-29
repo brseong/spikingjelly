@@ -10,15 +10,22 @@ import logging
 from . import surrogate, base
 from .auto_cuda import neuron_kernel as ac_neuron_kernel
 from .auto_cuda import ss_neuron_kernel as ss_ac_neuron_kernel
+
 try:
     import cupy
-    from . import neuron_kernel, cuda_utils
-
+    from . import cuda_kernel
 except BaseException as e:
     logging.info(f'spikingjelly.activation_based.neuron: {e}')
     cupy = None
-    neuron_kernel = None
-    cuda_utils = None
+    cuda_kernel = None
+
+try:
+    import triton
+    from . import triton_kernel
+except BaseException as e:
+    logging.info(f'spikingjelly.activation_based.neuron: {e}')
+    triton = None
+    triton_kernel = None
 
 
 class SimpleBaseNode(base.MemoryModule):
@@ -63,9 +70,11 @@ class SimpleBaseNode(base.MemoryModule):
             # hard reset
             self.v = spike_d * self.v_reset + (1. - spike_d) * self.v
 
+
 class SimpleIFNode(SimpleBaseNode):
     def neuronal_charge(self, x: torch.Tensor):
         self.v = self.v + x
+
 
 class SimpleLIFNode(SimpleBaseNode):
     def __init__(self, tau:float, decay_input: bool, v_threshold: float = 1., v_reset: float = 0.,
@@ -80,6 +89,7 @@ class SimpleLIFNode(SimpleBaseNode):
             self.v = self.v + (self.v_reset - self.v + x) / self.tau
         else:
             self.v = self.v + (self.v_reset - self.v) / self.tau + x
+
 
 class BaseNode(base.MemoryModule):
     def __init__(self, v_threshold: float = 1., v_reset: Optional[float] = 0.,
@@ -431,9 +441,12 @@ class AdaptBaseNode(BaseNode):
 
 
 class IFNode(BaseNode):
-    def __init__(self, v_threshold: float = 1., v_reset: Optional[float] = 0.,
-                 surrogate_function: Callable = surrogate.Sigmoid(), detach_reset: bool = False, step_mode='s',
-                 backend='torch', store_v_seq: bool = False):
+    def __init__(
+        self, v_threshold: float = 1., v_reset: Optional[float] = 0.,
+        surrogate_function: Callable = surrogate.Sigmoid(), 
+        detach_reset: bool = False, step_mode='s',
+        backend='torch', store_v_seq: bool = False
+    ):
         """
         * :ref:`API in English <IFNode.__init__-en>`
 
@@ -507,14 +520,17 @@ class IFNode(BaseNode):
             H[t] = V[t-1] + X[t]
 
         """
-        super().__init__(v_threshold, v_reset, surrogate_function, detach_reset, step_mode, backend, store_v_seq)
+        super().__init__(
+            v_threshold, v_reset, surrogate_function, detach_reset, step_mode, 
+            backend, store_v_seq
+        )
 
     @property
     def supported_backends(self):
         if self.step_mode == 's':
             return ('torch', 'cupy')
         elif self.step_mode == 'm':
-            return ('torch', 'cupy')
+            return ('torch', 'cupy', 'triton')
         else:
             raise ValueError(self.step_mode)
 
@@ -593,7 +609,6 @@ class IFNode(BaseNode):
                 return super().multi_step_forward(x_seq)
             elif self.backend == 'cupy':
                 hard_reset = self.v_reset is not None
-
                 if x_seq.dtype == torch.float:
                     dtype = 'float'
                 elif x_seq.dtype == torch.half:
@@ -601,54 +616,80 @@ class IFNode(BaseNode):
                 else:
                     raise NotImplementedError(x_seq.dtype)
 
-                if self.forward_kernel is None or not self.forward_kernel.check_attributes(hard_reset=hard_reset,
-                                                                                           dtype=dtype):
-                    self.forward_kernel = ac_neuron_kernel.IFNodeFPTTKernel(hard_reset=hard_reset, dtype=dtype)
-
+                if self.forward_kernel is None or not self.forward_kernel.check_attributes(
+                    hard_reset=hard_reset, dtype=dtype
+                ):
+                    self.forward_kernel = ac_neuron_kernel.IFNodeFPTTKernel(
+                        hard_reset=hard_reset, dtype=dtype
+                    )
                 if self.backward_kernel is None or not self.backward_kernel.check_attributes(
-                        surrogate_function=self.surrogate_function.cuda_codes, hard_reset=hard_reset,
-                        detach_reset=self.detach_reset, dtype=dtype):
+                    surrogate_function=self.surrogate_function.cuda_codes, 
+                    hard_reset=hard_reset,
+                    detach_reset=self.detach_reset, dtype=dtype
+                ):
                     self.backward_kernel = ac_neuron_kernel.IFNodeBPTTKernel(
-                        surrogate_function=self.surrogate_function.cuda_codes, hard_reset=hard_reset,
-                        detach_reset=self.detach_reset, dtype=dtype)
+                        surrogate_function=self.surrogate_function.cuda_codes, 
+                        hard_reset=hard_reset,
+                        detach_reset=self.detach_reset, dtype=dtype
+                    )
 
                 self.v_float_to_tensor(x_seq[0])
-
-                spike_seq, v_seq = ac_neuron_kernel.IFNodeATGF.apply(x_seq.flatten(1), self.v.flatten(0),
-                                                                     self.v_threshold, self.v_reset,
-                                                                     self.forward_kernel,
-                                                                     self.backward_kernel)
-
+                spike_seq, v_seq = ac_neuron_kernel.IFNodeATGF.apply(
+                    x_seq.flatten(1), self.v.flatten(0), self.v_threshold, 
+                    self.v_reset, self.forward_kernel, self.backward_kernel
+                )
                 spike_seq = spike_seq.reshape(x_seq.shape)
                 v_seq = v_seq.reshape(x_seq.shape)
-
                 if self.store_v_seq:
                     self.v_seq = v_seq
-
                 self.v = v_seq[-1].clone()
-
+                return spike_seq
+            elif self.backend == 'triton':
+                self.v_float_to_tensor(x_seq[0])
+                spike_seq, v_seq = triton_kernel.MultiStepIFNodePTT.apply(
+                    x_seq, self.v, self.v_threshold, self.v_reset, self.detach_reset,
+                    triton_kernel.sg.get_triton_surrogate_kernel(self.surrogate_function)
+                )
+                if self.store_v_seq:
+                    self.v_seq = v_seq
+                self.v = v_seq[-1].clone()
                 return spike_seq
             else:
                 raise ValueError(self.backend)
 
         else:
             self.v_float_to_tensor(x_seq[0])
+
+            if self.backend == 'triton':
+                self.v_float_to_tensor(x_seq[0])
+                spike_seq, v_seq = triton_kernel.MultiStepIFNodePTT.apply(
+                    x_seq, self.v, self.v_threshold, self.v_reset, self.detach_reset,
+                    triton_kernel.sg.get_triton_surrogate_kernel(self.surrogate_function)
+                )
+                if self.store_v_seq:
+                    self.v_seq = v_seq
+                self.v = v_seq[-1].clone()
+                return spike_seq
+
+            # torch & cupy backend:
             if self.v_reset is None:
                 if self.store_v_seq:
-                    spike_seq, self.v, self.v_seq = self.jit_eval_multi_step_forward_soft_reset_with_v_seq(x_seq,
-                                                                                                           self.v,
-                                                                                                           self.v_threshold)
+                    spike_seq, self.v, self.v_seq = self.jit_eval_multi_step_forward_soft_reset_with_v_seq(
+                        x_seq, self.v, self.v_threshold
+                    )
                 else:
-                    spike_seq, self.v = self.jit_eval_multi_step_forward_soft_reset(x_seq, self.v, self.v_threshold)
+                    spike_seq, self.v = self.jit_eval_multi_step_forward_soft_reset(
+                        x_seq, self.v, self.v_threshold
+                    )
             else:
                 if self.store_v_seq:
-                    spike_seq, self.v, self.v_seq = self.jit_eval_multi_step_forward_hard_reset_with_v_seq(x_seq,
-                                                                                                           self.v,
-                                                                                                           self.v_threshold,
-                                                                                                           self.v_reset)
+                    spike_seq, self.v, self.v_seq = self.jit_eval_multi_step_forward_hard_reset_with_v_seq(
+                        x_seq, self.v, self.v_threshold, self.v_reset
+                    )
                 else:
-                    spike_seq, self.v = self.jit_eval_multi_step_forward_hard_reset(x_seq, self.v, self.v_threshold,
-                                                                                    self.v_reset)
+                    spike_seq, self.v = self.jit_eval_multi_step_forward_hard_reset(
+                        x_seq, self.v, self.v_threshold, self.v_reset
+                    )
             return spike_seq
 
     def single_step_forward(self, x: torch.Tensor):
@@ -657,7 +698,6 @@ class IFNode(BaseNode):
                 return super().single_step_forward(x)
             elif self.backend == 'cupy':
                 hard_reset = self.v_reset is not None
-
                 if x.dtype == torch.float:
                     dtype = 'float'
                 elif x.dtype == torch.half:
@@ -665,29 +705,32 @@ class IFNode(BaseNode):
                 else:
                     raise NotImplementedError(x.dtype)
                 
-                if self.forward_kernel is None or not self.forward_kernel.check_attributes(hard_reset=hard_reset,
-                                                                                           dtype=dtype):
-                    self.forward_kernel = ss_ac_neuron_kernel.IFNodeFPKernel(hard_reset=hard_reset, dtype=dtype)
+                if self.forward_kernel is None or not self.forward_kernel.check_attributes(
+                    hard_reset=hard_reset, dtype=dtype
+                ):
+                    self.forward_kernel = ss_ac_neuron_kernel.IFNodeFPKernel(
+                        hard_reset=hard_reset, dtype=dtype
+                    )
 
                 if self.backward_kernel is None or not self.backward_kernel.check_attributes(
-                        surrogate_function=self.surrogate_function.cuda_codes, hard_reset=hard_reset,
-                        detach_reset=self.detach_reset, dtype=dtype):
+                    surrogate_function=self.surrogate_function.cuda_codes, 
+                    hard_reset=hard_reset,
+                    detach_reset=self.detach_reset, dtype=dtype
+                ):
                     self.backward_kernel = ss_ac_neuron_kernel.IFNodeBPKernel(
-                        surrogate_function=self.surrogate_function.cuda_codes, hard_reset=hard_reset,
-                        detach_reset=self.detach_reset, dtype=dtype)
+                        surrogate_function=self.surrogate_function.cuda_codes, 
+                        hard_reset=hard_reset,
+                        detach_reset=self.detach_reset, dtype=dtype
+                    )
 
                 self.v_float_to_tensor(x)
-
-                spike, v = ss_ac_neuron_kernel.IFNodeATGF.apply(x.flatten(0), self.v.flatten(0),
-                                                                     self.v_threshold, self.v_reset,
-                                                                     self.forward_kernel,
-                                                                     self.backward_kernel)
-
+                spike, v = ss_ac_neuron_kernel.IFNodeATGF.apply(
+                    x.flatten(0), self.v.flatten(0), self.v_threshold, 
+                    self.v_reset, self.forward_kernel, self.backward_kernel
+                )
                 spike = spike.reshape(x.shape)
                 v = v.reshape(x.shape)
-
                 self.v = v
-
                 return spike
             else:
                 raise ValueError(self.backend)
@@ -695,16 +738,22 @@ class IFNode(BaseNode):
         else:
             self.v_float_to_tensor(x)
             if self.v_reset is None:
-                spike, self.v = self.jit_eval_single_step_forward_soft_reset(x, self.v, self.v_threshold)
+                spike, self.v = self.jit_eval_single_step_forward_soft_reset(
+                    x, self.v, self.v_threshold
+                )
             else:
-                spike, self.v = self.jit_eval_single_step_forward_hard_reset(x, self.v, self.v_threshold, self.v_reset)
+                spike, self.v = self.jit_eval_single_step_forward_hard_reset(
+                    x, self.v, self.v_threshold, self.v_reset
+                )
             return spike
 
 
 class LIFNode(BaseNode):
-    def __init__(self, tau: float = 2., decay_input: bool = True, v_threshold: float = 1.,
-                 v_reset: Optional[float] = 0., surrogate_function: Callable = surrogate.Sigmoid(),
-                 detach_reset: bool = False, step_mode='s', backend='torch', store_v_seq: bool = False):
+    def __init__(
+        self, tau: float = 2., decay_input: bool = True, v_threshold: float = 1.,
+        v_reset: Optional[float] = 0., surrogate_function: Callable = surrogate.Sigmoid(),
+        detach_reset: bool = False, step_mode='s', backend='torch', store_v_seq: bool = False
+    ):
         """
         * :ref:`API in English <LIFNode.__init__-en>`
 
@@ -807,7 +856,10 @@ class LIFNode(BaseNode):
         """
         assert isinstance(tau, float) and tau > 1.
 
-        super().__init__(v_threshold, v_reset, surrogate_function, detach_reset, step_mode, backend, store_v_seq)
+        super().__init__(
+            v_threshold, v_reset, surrogate_function, detach_reset, 
+            step_mode, backend, store_v_seq
+        )
 
         self.tau = tau
         self.decay_input = decay_input
@@ -817,7 +869,7 @@ class LIFNode(BaseNode):
         if self.step_mode == 's':
             return ('torch', 'cupy')
         elif self.step_mode == 'm':
-            return ('torch', 'cupy')
+            return ('torch', 'cupy', 'triton')
         else:
             raise ValueError(self.step_mode)
 
@@ -1009,40 +1061,38 @@ class LIFNode(BaseNode):
                 return super().single_step_forward(x)
             elif self.backend == 'cupy':
                 hard_reset = self.v_reset is not None
-
                 if x.dtype == torch.float:
                     dtype = 'float'
                 elif x.dtype == torch.half:
                     dtype = 'half2'
                 else:
                     raise NotImplementedError(x.dtype)
-                
-                if self.forward_kernel is None or not self.forward_kernel.check_attributes(hard_reset=hard_reset,
-                                                                                           dtype=dtype,
-                                                                                           decay_input=self.decay_input):
-                    self.forward_kernel = ss_ac_neuron_kernel.LIFNodeFPKernel(decay_input=self.decay_input,
-                                                                              hard_reset=hard_reset, dtype=dtype)
+
+                if self.forward_kernel is None or not self.forward_kernel.check_attributes(
+                    hard_reset=hard_reset, dtype=dtype, decay_input=self.decay_input
+                ):
+                    self.forward_kernel = ss_ac_neuron_kernel.LIFNodeFPKernel(
+                        decay_input=self.decay_input, hard_reset=hard_reset, dtype=dtype
+                    )
 
                 if self.backward_kernel is None or not self.backward_kernel.check_attributes(
-                        surrogate_function=self.surrogate_function.cuda_codes, hard_reset=hard_reset,
-                        detach_reset=self.detach_reset, dtype=dtype, decay_input=self.decay_input):
+                    surrogate_function=self.surrogate_function.cuda_codes, hard_reset=hard_reset,
+                    detach_reset=self.detach_reset, dtype=dtype, decay_input=self.decay_input
+                ):
                     self.backward_kernel = ss_ac_neuron_kernel.LIFNodeBPKernel(
                         decay_input=self.decay_input,
                         surrogate_function=self.surrogate_function.cuda_codes, hard_reset=hard_reset,
-                        detach_reset=self.detach_reset, dtype=dtype)
+                        detach_reset=self.detach_reset, dtype=dtype
+                    )
 
                 self.v_float_to_tensor(x)
-
-                spike, v = ss_ac_neuron_kernel.LIFNodeATGF.apply(x.flatten(0), self.v.flatten(0),
-                                                                 self.v_threshold, self.v_reset, 1. / self.tau,
-                                                                 self.forward_kernel,
-                                                                 self.backward_kernel)
-
+                spike, v = ss_ac_neuron_kernel.LIFNodeATGF.apply(
+                    x.flatten(0), self.v.flatten(0), self.v_threshold, 
+                    self.v_reset, 1. / self.tau, self.forward_kernel, self.backward_kernel
+                )
                 spike = spike.reshape(x.shape)
                 v = v.reshape(x.shape)
-
                 self.v = v
-
                 return spike
             else:
                 raise ValueError(self.backend)
@@ -1051,22 +1101,22 @@ class LIFNode(BaseNode):
             self.v_float_to_tensor(x)
             if self.v_reset is None:
                 if self.decay_input:
-                    spike, self.v = self.jit_eval_single_step_forward_soft_reset_decay_input(x, self.v,
-                                                                                             self.v_threshold, self.tau)
+                    spike, self.v = self.jit_eval_single_step_forward_soft_reset_decay_input(
+                        x, self.v, self.v_threshold, self.tau
+                    )
                 else:
-                    spike, self.v = self.jit_eval_single_step_forward_soft_reset_no_decay_input(x, self.v,
-                                                                                                self.v_threshold,
-                                                                                                self.tau)
+                    spike, self.v = self.jit_eval_single_step_forward_soft_reset_no_decay_input(
+                        x, self.v, self.v_threshold, self.tau
+                    )
             else:
                 if self.decay_input:
-                    spike, self.v = self.jit_eval_single_step_forward_hard_reset_decay_input(x, self.v,
-                                                                                             self.v_threshold,
-                                                                                             self.v_reset, self.tau)
+                    spike, self.v = self.jit_eval_single_step_forward_hard_reset_decay_input(
+                        x, self.v, self.v_threshold, self.v_reset, self.tau
+                    )
                 else:
-                    spike, self.v = self.jit_eval_single_step_forward_hard_reset_no_decay_input(x, self.v,
-                                                                                                self.v_threshold,
-                                                                                                self.v_reset,
-                                                                                                self.tau)
+                    spike, self.v = self.jit_eval_single_step_forward_hard_reset_no_decay_input(
+                        x, self.v, self.v_threshold, self.v_reset, self.tau
+                    )
             return spike
 
     def multi_step_forward(self, x_seq: torch.Tensor):
@@ -1074,7 +1124,6 @@ class LIFNode(BaseNode):
             if self.backend == 'torch':
                 return super().multi_step_forward(x_seq)
             elif self.backend == 'cupy':
-
                 hard_reset = self.v_reset is not None
                 if x_seq.dtype == torch.float:
                     dtype = 'float'
@@ -1083,79 +1132,105 @@ class LIFNode(BaseNode):
                 else:
                     raise NotImplementedError(x_seq.dtype)
 
-                if self.forward_kernel is None or not self.forward_kernel.check_attributes(hard_reset=hard_reset,
-                                                                                           dtype=dtype,
-                                                                                           decay_input=self.decay_input):
-                    self.forward_kernel = ac_neuron_kernel.LIFNodeFPTTKernel(decay_input=self.decay_input,
-                                                                             hard_reset=hard_reset, dtype=dtype)
-
+                if self.forward_kernel is None or not self.forward_kernel.check_attributes(
+                    hard_reset=hard_reset, dtype=dtype, decay_input=self.decay_input
+                ):
+                    self.forward_kernel = ac_neuron_kernel.LIFNodeFPTTKernel(
+                        decay_input=self.decay_input, 
+                        hard_reset=hard_reset, 
+                        dtype=dtype
+                    )
                 if self.backward_kernel is None or not self.backward_kernel.check_attributes(
                         surrogate_function=self.surrogate_function.cuda_codes, hard_reset=hard_reset,
-                        detach_reset=self.detach_reset, dtype=dtype, decay_input=self.decay_input):
-                    self.backward_kernel = ac_neuron_kernel.LIFNodeBPTTKernel(decay_input=self.decay_input,
-                                                                              surrogate_function=self.surrogate_function.cuda_codes,
-                                                                              hard_reset=hard_reset,
-                                                                              detach_reset=self.detach_reset,
-                                                                              dtype=dtype)
+                        detach_reset=self.detach_reset, dtype=dtype, decay_input=self.decay_input
+                ):
+                    self.backward_kernel = ac_neuron_kernel.LIFNodeBPTTKernel(
+                        decay_input=self.decay_input,
+                        surrogate_function=self.surrogate_function.cuda_codes,
+                        hard_reset=hard_reset,
+                        detach_reset=self.detach_reset,
+                        dtype=dtype
+                    )
 
                 self.v_float_to_tensor(x_seq[0])
-
-                spike_seq, v_seq = ac_neuron_kernel.LIFNodeATGF.apply(x_seq.flatten(1), self.v.flatten(0),
-                                                                      self.v_threshold, self.v_reset, 1. / self.tau,
-                                                                      self.forward_kernel,
-                                                                      self.backward_kernel)
-
+                spike_seq, v_seq = ac_neuron_kernel.LIFNodeATGF.apply(
+                    x_seq.flatten(1), self.v.flatten(0),
+                    self.v_threshold, self.v_reset, 1. / self.tau,
+                    self.forward_kernel, self.backward_kernel
+                )
                 spike_seq = spike_seq.reshape(x_seq.shape)
                 v_seq = v_seq.reshape(x_seq.shape)
-
                 if self.store_v_seq:
                     self.v_seq = v_seq
-
                 self.v = v_seq[-1].clone()
-
+                return spike_seq
+            elif self.backend == 'triton':
+                self.v_float_to_tensor(x_seq[0])
+                spike_seq, v_seq = triton_kernel.MultiStepLIFNodePTT.apply(
+                    x_seq, self.v, self.decay_input, self.tau, self.v_threshold,
+                    self.v_reset, self.detach_reset, 
+                    triton_kernel.sg.get_triton_surrogate_kernel(self.surrogate_function)
+                )
+                if self.store_v_seq:
+                    self.v_seq = v_seq
+                self.v = v_seq[-1].clone()
                 return spike_seq
             else:
                 raise ValueError(self.backend)
 
         else:
             self.v_float_to_tensor(x_seq[0])
+
+            if self.backend == 'triton':
+                spike_seq, v_seq = triton_kernel.MultiStepLIFNodePTT.apply(
+                    x_seq, self.v, self.decay_input, self.tau, self.v_threshold,
+                    self.v_reset, self.detach_reset, 
+                    triton_kernel.sg.get_triton_surrogate_kernel(self.surrogate_function)
+                )
+                if self.store_v_seq:
+                    self.v_seq = v_seq
+                self.v = v_seq[-1].clone()
+                return spike_seq
+
+            # torch & cupy backend:
             if self.v_reset is None:
                 if self.decay_input:
                     if self.store_v_seq:
                         spike_seq, self.v, self.v_seq = self.jit_eval_multi_step_forward_soft_reset_decay_input_with_v_seq(
-                            x_seq, self.v, self.v_threshold, self.tau)
+                            x_seq, self.v, self.v_threshold, self.tau
+                        )
                     else:
-                        spike_seq, self.v = self.jit_eval_multi_step_forward_soft_reset_decay_input(x_seq, self.v,
-                                                                                                    self.v_threshold,
-                                                                                                    self.tau)
+                        spike_seq, self.v = self.jit_eval_multi_step_forward_soft_reset_decay_input(
+                            x_seq, self.v, self.v_threshold, self.tau
+                        )
                 else:
                     if self.store_v_seq:
                         spike_seq, self.v, self.v_seq = self.jit_eval_multi_step_forward_soft_reset_no_decay_input_with_v_seq(
-                            x_seq, self.v, self.v_threshold, self.tau)
+                            x_seq, self.v, self.v_threshold, self.tau
+                        )
                     else:
-                        spike_seq, self.v = self.jit_eval_multi_step_forward_soft_reset_no_decay_input(x_seq, self.v,
-                                                                                                       self.v_threshold,
-                                                                                                       self.tau)
+                        spike_seq, self.v = self.jit_eval_multi_step_forward_soft_reset_no_decay_input(
+                            x_seq, self.v, self.v_threshold, self.tau
+                        )
             else:
                 if self.decay_input:
                     if self.store_v_seq:
                         spike_seq, self.v, self.v_seq = self.jit_eval_multi_step_forward_hard_reset_decay_input_with_v_seq(
-                            x_seq, self.v, self.v_threshold, self.v_reset, self.tau)
+                            x_seq, self.v, self.v_threshold, self.v_reset, self.tau
+                        )
                     else:
-                        spike_seq, self.v = self.jit_eval_multi_step_forward_hard_reset_decay_input(x_seq, self.v,
-                                                                                                    self.v_threshold,
-                                                                                                    self.v_reset,
-                                                                                                    self.tau)
+                        spike_seq, self.v = self.jit_eval_multi_step_forward_hard_reset_decay_input(
+                            x_seq, self.v, self.v_threshold, self.v_reset, self.tau
+                        )
                 else:
                     if self.store_v_seq:
                         spike_seq, self.v, self.v_seq = self.jit_eval_multi_step_forward_hard_reset_no_decay_input_with_v_seq(
-                            x_seq, self.v, self.v_threshold, self.v_reset, self.tau)
+                            x_seq, self.v, self.v_threshold, self.v_reset, self.tau
+                        )
                     else:
-                        spike_seq, self.v = self.jit_eval_multi_step_forward_hard_reset_no_decay_input(x_seq, self.v,
-                                                                                                       self.v_threshold,
-                                                                                                       self.v_reset,
-                                                                                                       self.tau)
-
+                        spike_seq, self.v = self.jit_eval_multi_step_forward_hard_reset_no_decay_input(
+                            x_seq, self.v, self.v_threshold, self.v_reset, self.tau
+                        )
             return spike_seq
 
 
@@ -1279,14 +1354,14 @@ class ParametricLIFNode(BaseNode):
         super().__init__(v_threshold, v_reset, surrogate_function, detach_reset, step_mode, backend, store_v_seq)
         self.decay_input = decay_input
         init_w = - math.log(init_tau - 1.)
-        self.w = nn.Parameter(torch.as_tensor(init_w))
+        self.w = nn.Parameter(torch.as_tensor(init_w)) # as reciprocal_tau
 
     @property
     def supported_backends(self):
         if self.step_mode == 's':
             return ('torch',)
         elif self.step_mode == 'm':
-            return ('torch', 'cupy')
+            return ('torch', 'cupy', 'triton')
         else:
             raise ValueError(self.step_mode)
 
@@ -1318,36 +1393,45 @@ class ParametricLIFNode(BaseNode):
                 dtype = 'half2'
             else:
                 raise NotImplementedError(x_seq.dtype)
-
-            if self.forward_kernel is None or not self.forward_kernel.check_attributes(hard_reset=hard_reset,
-                                                                                       dtype=dtype,
-                                                                                       decay_input=self.decay_input):
-                self.forward_kernel = ac_neuron_kernel.ParametricLIFNodeFPTTKernel(decay_input=self.decay_input,
-                                                                                   hard_reset=hard_reset, dtype=dtype)
-
+            if self.forward_kernel is None or not self.forward_kernel.check_attributes(
+                hard_reset=hard_reset, dtype=dtype, decay_input=self.decay_input
+            ):
+                self.forward_kernel = ac_neuron_kernel.ParametricLIFNodeFPTTKernel(
+                    decay_input=self.decay_input, hard_reset=hard_reset, dtype=dtype
+                )
             if self.backward_kernel is None or not self.backward_kernel.check_attributes(
-                    surrogate_function=self.surrogate_function.cuda_codes, hard_reset=hard_reset,
-                    detach_reset=self.detach_reset, dtype=dtype, decay_input=self.decay_input):
-                self.backward_kernel = ac_neuron_kernel.ParametricLIFNodeBPTTKernel(decay_input=self.decay_input,
-                                                                                    surrogate_function=self.surrogate_function.cuda_codes,
-                                                                                    hard_reset=hard_reset,
-                                                                                    detach_reset=self.detach_reset,
-                                                                                    dtype=dtype)
-
+                    surrogate_function=self.surrogate_function.cuda_codes,
+                    hard_reset=hard_reset, detach_reset=self.detach_reset,
+                    dtype=dtype, decay_input=self.decay_input
+            ):
+                self.backward_kernel = ac_neuron_kernel.ParametricLIFNodeBPTTKernel(
+                    decay_input=self.decay_input,
+                    surrogate_function=self.surrogate_function.cuda_codes,
+                    hard_reset=hard_reset,
+                    detach_reset=self.detach_reset,
+                    dtype=dtype
+                )
             self.v_float_to_tensor(x_seq[0])
-
             spike_seq, v_seq = ac_neuron_kernel.ParametricLIFNodeATGF.apply(
                 x_seq.flatten(1), self.v.flatten(0), self.v_threshold, self.v_reset, self.w.sigmoid().to(x_seq),
                 self.forward_kernel, self.backward_kernel)
-
             spike_seq = spike_seq.reshape(x_seq.shape)
             v_seq = v_seq.reshape(x_seq.shape)
-
             if self.store_v_seq:
                 self.v_seq = v_seq
-
             self.v = v_seq[-1].clone()
-
+            return spike_seq
+        elif self.backend == 'triton':
+            self.v_float_to_tensor(x_seq[0])
+            spike_seq, v_seq = triton_kernel.MultiStepParametricLIFNodePTT.apply(
+                x_seq, self.v, self.w.sigmoid().to(x_seq),
+                self.decay_input, self.v_threshold,
+                self.v_reset, self.detach_reset,
+                triton_kernel.sg.get_triton_surrogate_kernel(self.surrogate_function)
+            )
+            if self.store_v_seq:
+                self.v_seq = v_seq
+            self.v = v_seq[-1].clone()
             return spike_seq
         else:
             raise ValueError(self.backend)
@@ -1486,7 +1570,7 @@ class QIFNode(BaseNode):
         elif self.backend == 'cupy':
             self.v_float_to_tensor(x_seq[0])
 
-            spike_seq, v_seq = neuron_kernel.MultiStepQIFNodePTT.apply(
+            spike_seq, v_seq = cuda_kernel.MultiStepQIFNodePTT.apply(
                 x_seq.flatten(1), self.v.flatten(0), self.tau, self.v_threshold, self.v_reset, self.v_rest,
                 self.v_c, self.a0, self.detach_reset, self.surrogate_function.cuda_code)
 
@@ -1638,7 +1722,7 @@ class EIFNode(BaseNode):
         elif self.backend == 'cupy':
             self.v_float_to_tensor(x_seq[0])
 
-            spike_seq, v_seq = neuron_kernel.MultiStepEIFNodePTT.apply(
+            spike_seq, v_seq = cuda_kernel.MultiStepEIFNodePTT.apply(
                 x_seq.flatten(1), self.v.flatten(0), self.tau, self.v_threshold, self.v_reset, self.v_rest,
                 self.theta_rh, self.delta_T, self.detach_reset, self.surrogate_function.cuda_code)
 
@@ -1692,7 +1776,7 @@ class IzhikevichNode(AdaptBaseNode):
             self.v_float_to_tensor(x_seq[0])
             self.w_float_to_tensor(x_seq[0])
 
-            spike_seq, v_seq, w_seq = neuron_kernel.MultiStepIzhikevichNodePTT.apply(
+            spike_seq, v_seq, w_seq = cuda_kernel.MultiStepIzhikevichNodePTT.apply(
                 x_seq.flatten(1), self.v.flatten(0), self.w.flatten(0), self.tau, self.v_threshold, self.v_reset,
                 self.v_rest, self.a, self.b, self.tau_w,
                 self.v_c, self.a0, self.detach_reset, self.surrogate_function.cuda_code)
@@ -3823,3 +3907,337 @@ class NoisyNonSpikingBaseNode(nn.Module, base.MultiStepModule):
 class NoisyNonSpikingIFNode(NoisyNonSpikingBaseNode):
     def neuronal_charge(self, x: torch.Tensor):
         self.v = self.v + x
+
+
+##########################################################################################################
+# Membrane Potential Batch Normalization and Threshold Modulation modules
+##########################################################################################################
+
+class MPBNBaseNode(BaseNode):
+    def __init__(self, v_threshold: float = 1., v_reset: Optional[float] = 0.,
+                 surrogate_function: Callable = surrogate.Sigmoid(), detach_reset: bool = False,
+                 step_mode = 's', backend = 'torch', store_v_seq: bool = False, mpbn: bool = True, 
+                 out_features = None, out_channels = None, learnable_vth: bool = False,
+                 bn_momentum: float = 0.1, bn_decay_momentum: float = 0.94, bn_min_momentum: float = 0.005):
+        r"""
+        * :ref:`API in English <MPBNBaseNode.__init__-en>`
+
+        .. _MPBNBaseNode.__init__-cn:
+
+        :param mpbn: 是否启用MPBN
+        :type mpbn: bool
+
+        :param out_features: 特征维度，用于线性层后
+        :type out_features: int
+
+        :param out_channels: 特征通道数，用于2D卷积层后
+        :type out_channels: int
+
+        :param learnable_vth: 阈值是否可训练
+        :type learnable_vth: bool
+
+        :param bn_momentum: 阈值重参数化后，更新统计量时使用的动量
+        :type bn_momentum: float
+
+        :param bn_decay_momentum: 阈值重参数化后，更新统计量时使用的动量衰减
+        :type bn_decay_momentum: float
+
+        :param bn_min_momentum: 阈值重参数化后，更新统计量时使用的最小动量
+        :type bn_min_momentum: float
+        其余参数与 :class:`BaseNode` 相同。
+
+        `Membrane Potential Batch Normalization for Spiking Neural Networks <https://arxiv.org/abs/2308.08359>` 提出的对膜电压进行批量归一化的神经元模型基类。
+        `Threshold Modulation for Online Test-Time Adaptation of Spiking Neural Networks <https://arxiv.org/abs/2505.05375>` 在此基础上引入阈值调制模块来进行测试时适应任务并降低能耗。
+
+        .. math::
+            :nowrap:
+            \begin{aligned}
+                H'[t] &= \mathbf{BN}(H[t]) && \text{（训练时）} \\
+                (\tilde{V}_{th})_{i} &= \frac{(V_{th}-\beta_{i})\sqrt{\sigma_{i}^{2}}}{\gamma_{i}}+\mu_{i} && \text{（测试时适应）}
+            \end{aligned}
+        
+        * :ref:`中文API <MPBNBaseNode.__init__-cn>`
+
+        .. _MPBNBaseNode.__init__-en:
+
+        :param mpbn: whether to enable MPBN
+        :type mpbn: bool
+
+        :param out_features: feature dimension, when used after `Linear`
+        :type out_features: int
+
+        :param out_channels: number of channels, when used after `Conv2d` 
+        :type out_channels: int
+
+        :param learnable_vth: whether to train a (positive) threshold
+        :type learnable_vth: bool
+
+        :param bn_momentum: the momentum used in statistics update after threshold re-parameterization
+        :type bn_momentum: float
+
+        :param bn_decay_momentum: the momentum decay used in statistics update after threshold re-parameterization
+        :type bn_decay_momentum: float
+
+        :param bn_min_momentum: the minimum momentum used in statistics update after threshold re-parameterization
+        :type bn_min_momentum: float
+        Other parameters are the same as :class:`BaseNode`.
+
+        Base class of neuron with membrane potential batch normalization proposed in `Membrane Potential Batch Normalization for Spiking Neural Networks <https://arxiv.org/abs/2308.08359>`.
+        `Threshold Modulation for Online Test-Time Adaptation of Spiking Neural Networks <https://arxiv.org/abs/2505.05375>` further introduces a Threshold Modulation module after threshold re-parameterization 
+        to enable test-time adaptation and reduce energy consumption.
+
+        .. math::
+            :nowrap:
+            \begin{aligned}
+                H'[t] &= \mathbf{BN}(H[t]) && \text{(training)} \\
+                (\tilde{V}_{th})_{i} &= \frac{(V_{th}-\beta_{i})\sqrt{\sigma_{i}^{2}}}{\gamma_{i}}+\mu_{i} && \text{(test-time adaptation)}
+            \end{aligned}
+
+        """
+        super().__init__(v_threshold, v_reset, surrogate_function, detach_reset, step_mode, backend, store_v_seq)
+        assert out_features is None and out_channels is not None or out_features is not None and out_channels is None, \
+            "One of out_features or out_channels should be specified."
+        self.out_features = out_features
+        self.out_channels = out_channels
+        self.mpbn = mpbn
+        if mpbn:
+            if out_features is None and out_channels is not None:
+                self.vbn = nn.LazyBatchNorm2d()
+            else:
+                self.vbn = nn.LazyBatchNorm1d()
+        else:
+            self.vbn = nn.Identity()
+
+        self.register_buffer('mu', None)
+        self.register_buffer('sigma2', None)
+        self.gamma = None
+        self.beta = None
+        self.eps = None
+
+        self.fold_bn = False
+        self.normalize_residual = False
+        self.running_stats = False
+
+        self.bn_momentum = bn_momentum
+        self.bn_decay_momentum = bn_decay_momentum
+        self.bn_min_momentum = bn_min_momentum
+
+        self.learnable_vth = learnable_vth
+        if learnable_vth:  # force the threshold to be positive
+            self.a = nn.Parameter(torch.full((out_channels or out_features,), 0.))
+        
+        self.register_memory('vth', v_threshold)
+
+    def init_vth(self, x: torch.Tensor):
+        if isinstance(self.vth, float):
+            if isinstance(self.v_threshold, float):
+                self.vth = torch.full((x.shape[1],), self.v_threshold, device=x.device, dtype=x.dtype)
+            else:
+                self.vth = self.v_threshold
+            self.vth_ = self.vth
+    
+    def compute_running_stats(self, v: torch.Tensor):  # you can disable this completely by overiding it in subclasses
+        if v.ndim == 2:
+            if v.shape[0] == 1:
+                return
+            mu = torch.mean(v, dim=0).detach()
+            sigma2 = torch.var(v, dim=0, unbiased=True).detach()
+            if self.running_stats:
+                if self.mu is None or self.sigma2 is None:
+                    self.mu = mu
+                    self.sigma2 = sigma2
+                else:
+                    self.mu = self.mu.detach() * (1 - self.bn_momentum) + mu * self.bn_momentum
+                    self.sigma2 = self.sigma2.detach() * (1 - self.bn_momentum) + sigma2 * self.bn_momentum
+                    self.bn_momentum = max(self.bn_momentum * self.bn_decay_momentum, self.bn_min_momentum)
+            else:
+                self.mu = mu
+                self.sigma2 = sigma2
+        elif v.ndim == 4:
+            mu = torch.mean(v, dim=(0, 2, 3)).detach()
+            sigma2 = torch.var(v, dim=(0, 2, 3), unbiased=True).detach()
+            if self.running_stats:
+                if self.mu is None or self.sigma2 is None:
+                    self.mu = mu
+                    self.sigma2 = sigma2
+                else:
+                    self.mu = self.mu.detach() * (1 - self.bn_momentum) + mu * self.bn_momentum
+                    self.sigma2 = self.sigma2.detach() * (1 - self.bn_momentum) + sigma2 * self.bn_momentum
+                    self.bn_momentum = max(self.bn_momentum * self.bn_decay_momentum, self.bn_min_momentum)
+            else:
+                self.mu = mu
+                self.sigma2 = sigma2
+        else:
+            raise NotImplementedError(f"Only 2D and 4D tensor are supported, but got {v.ndim}D tensor.")
+    
+    def pre_charge(self, x: torch.Tensor):
+        raise NotImplementedError("This method should be implemented in subclasses, e.g. the charging function of LIF neuron.")
+
+    def neuronal_charge(self, x: torch.Tensor):
+        self.pre_charge(x)
+        self.v = self.vbn(self.v)
+        if self.fold_bn and not self.learnable_vth and self.training:
+            self.compute_running_stats(self.v)
+
+    def neuronal_fire(self):
+        if self.v.ndim == 2:
+            if self.fold_bn and not self.learnable_vth:
+                self.vth = (self.vth_ - self.beta) * torch.sqrt(self.sigma2 + self.eps) / self.gamma + self.mu
+            if self.learnable_vth:
+                self.vth = torch.exp(self.a)
+            diff = self.v - self.vth.view(1, self.vth.shape[0])
+            spike = self.surrogate_function(diff)
+            if self.normalize_residual:
+                mask = diff <= 0
+                gamma = self.gamma.unsqueeze(0).expand_as(mask)
+                mu = self.mu.unsqueeze(0).expand_as(mask)
+                beta = self.beta.unsqueeze(0).expand_as(mask)
+                sigma = torch.sqrt(self.sigma2 + self.eps).unsqueeze(0).expand_as(mask)
+                normalized_residual = (self.v[mask] - mu[mask]) / sigma[mask] * gamma[mask] + beta[mask]
+                self.v.masked_scatter_(mask, normalized_residual)
+        elif self.v.ndim == 4:
+            if self.fold_bn and not self.learnable_vth:
+                self.vth = (self.vth_ - self.beta) * torch.sqrt(self.sigma2 + self.eps) / self.gamma + self.mu
+            if self.learnable_vth:
+                self.vth = torch.exp(self.a)
+            diff = self.v - self.vth.view(1, self.vth.shape[0], 1, 1)
+            spike = self.surrogate_function(diff)
+            if self.normalize_residual:
+                mask = diff <= 0
+                gamma = self.gamma.view(1, -1, 1, 1).expand_as(mask)
+                mu = self.mu.view(1, -1, 1, 1).expand_as(mask)
+                beta = self.beta.view(1, -1, 1, 1).expand_as(mask)
+                sigma = torch.sqrt(self.sigma2 + self.eps).view(1, -1, 1, 1).expand_as(mask)
+                normalized_residual = (self.v[mask] - mu[mask]) / sigma[mask] * gamma[mask] + beta[mask]
+                self.v.masked_scatter_(mask, normalized_residual)
+        else:
+            raise NotImplementedError(f"Only 2D and 4D tensors are supported, but got {self.v.ndim}D tensors.")
+        return spike
+
+    def single_step_forward(self, x: torch.Tensor):
+        self.init_vth(x)
+        self.v_float_to_tensor(x)
+        self.neuronal_charge(x)
+        spike = self.neuronal_fire()
+        self.neuronal_reset(spike)
+        return spike
+
+    def re_parameterize_v_threshold(self, normalize_residual: bool = False, running_stats: bool = False):
+        # "re-parameterize" threshold to enable TTA capability
+        if isinstance(self.vbn, nn.Identity):
+            if self.fold_bn == True:
+                print(f"Re-parameterization has already been done in this neuron, skipping...")
+            else:
+                print(f"MPBN is not enabled in this neuron, skipping...")
+            return
+        self.fold_bn = True
+        if self.learnable_vth:  # if self.a is learned during training:
+            with torch.no_grad():
+                self.v_threshold = torch.exp(self.a)
+            self.learnable_vth = False
+        self.normalize_residual = normalize_residual
+        self.running_stats = running_stats
+        self.mu = self.vbn.running_mean
+        self.sigma2 = self.vbn.running_var
+        self.gamma = nn.Parameter(self.vbn.weight)
+        self.beta = nn.Parameter(self.vbn.bias)
+        self.eps = self.vbn.eps
+        self.vbn = nn.Identity()
+
+
+class MPBNLIFNode(MPBNBaseNode):
+    def __init__(self, tau: float = 2., decay_input: bool = False, v_threshold: float = 1.,
+                 v_reset: Optional[float] = 0., surrogate_function: Callable = surrogate.Sigmoid(),
+                 detach_reset: bool = False, step_mode = 's', backend = 'torch', store_v_seq: bool = False,
+                 mpbn: bool = True, out_features = None, out_channels = None, learnable_vth: bool = False,
+                 bn_momentum: float = 0.1, bn_decay_momentum: float = 0.94, bn_min_momentum: float = 0.005):
+        r"""
+        * :ref:`API in English <MPBNLIFNode.__init__-en>`
+
+        .. _MPBNLIFNode.__init__-cn:
+
+        :param tau: LIF中的时间常数
+        :type tau: float
+
+        :param decay_input: 输入是否参与衰减
+        :type decay_input: bool
+        其余参数与 :class:`MPBNBaseNode` 相同。
+
+        `Membrane Potential Batch Normalization for Spiking Neural Networks <https://arxiv.org/abs/2308.08359>` 中使用的对膜电压进行批量归一化的LIF神经元模型。
+        `Threshold Modulation for Online Test-Time Adaptation of Spiking Neural Networks <https://arxiv.org/abs/2505.05375>` 在此基础上引入阈值调制模块来进行测试时适应任务并降低能耗。
+
+        .. math::
+            :nowrap:
+            \begin{aligned}
+                H'[t] &= \mathbf{BN}(H[t]) && \text{（训练时）} \\
+                (\tilde{V}_{th})_{i} &= \frac{(V_{th}-\beta_{i})\sqrt{\sigma_{i}^{2}}}{\gamma_{i}}+\mu_{i} && \text{（测试时适应）}
+            \end{aligned}
+        
+        * :ref:`中文API <MPBNLIFNode.__init__-cn>`
+
+        .. _MPBNLIFNode.__init__-en:
+
+        :param tau: time constant in LIF
+        :type tau: float
+
+        :param decay_input: whether the input current is decayed
+        :type decay_input: bool
+        Other parameters are the same as :class:`MPBNBaseNode`.
+
+        LIF neuron with membrane potential batch normalization used in `Membrane Potential Batch Normalization for Spiking Neural Networks <https://arxiv.org/abs/2308.08359>`.
+        `Threshold Modulation for Online Test-Time Adaptation of Spiking Neural Networks <https://arxiv.org/abs/2505.05375>` further introduces a Threshold Modulation module after threshold re-parameterization.
+
+        .. math::
+            :nowrap:
+            \begin{aligned}
+                H'[t] &= \mathbf{BN}(H[t]) && \text{(training)} \\
+                (\tilde{V}_{th})_{i} &= \frac{(V_{th}-\beta_{i})\sqrt{\sigma_{i}^{2}}}{\gamma_{i}}+\mu_{i} && \text{(test-time adaptation)}
+            \end{aligned}
+
+        """
+        assert isinstance(tau, float) and tau > 1.
+        super().__init__(v_threshold, v_reset, surrogate_function, detach_reset, step_mode, backend, store_v_seq,
+                         mpbn, out_features, out_channels, learnable_vth, bn_momentum, bn_decay_momentum, bn_min_momentum)
+
+        self.tau = tau
+        self.decay_input = decay_input
+    
+    @property
+    def supported_backends(self):
+        return ('torch')
+
+    def pre_charge(self, x: torch.Tensor):
+        if self.decay_input:
+            if self.v_reset is None or self.v_reset == 0.:
+                self.v = self.neuronal_charge_decay_input_reset0(x, self.v, self.tau)
+            else:
+                self.v = self.neuronal_charge_decay_input(x, self.v, self.v_reset, self.tau)
+        else:
+            if self.v_reset is None or self.v_reset == 0.:
+                self.v = self.neuronal_charge_no_decay_input_reset0(x, self.v, self.tau)
+            else:
+                self.v = self.neuronal_charge_no_decay_input(x, self.v, self.v_reset, self.tau)
+
+    @staticmethod
+    @torch.jit.script
+    def neuronal_charge_decay_input_reset0(x: torch.Tensor, v: torch.Tensor, tau: float):
+        v = v + (x - v) / tau
+        return v
+
+    @staticmethod
+    @torch.jit.script
+    def neuronal_charge_decay_input(x: torch.Tensor, v: torch.Tensor, v_reset: float, tau: float):
+        v = v + (x - (v - v_reset)) / tau
+        return v
+
+    @staticmethod
+    @torch.jit.script
+    def neuronal_charge_no_decay_input_reset0(x: torch.Tensor, v: torch.Tensor, tau: float):
+        v = v * (1. - 1. / tau) + x
+        return v
+
+    @staticmethod
+    @torch.jit.script
+    def neuronal_charge_no_decay_input(x: torch.Tensor, v: torch.Tensor, v_reset: float, tau: float):
+        v = v - (v - v_reset) / tau + x
+        return v
